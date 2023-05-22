@@ -9,13 +9,14 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import nnx
+from flax.training import train_state
 
 
 @dataclass
@@ -88,9 +89,9 @@ class MLP(nnx.Module):
 class Block(nnx.Module):
     def __init__(self, config: GPTConfig, *, ctx: nnx.Context):
         self.ln_1 = nnx.LayerNorm(config.n_embd, epsilon=1e-5, ctx=ctx)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, ctx=ctx)
         self.ln_2 = nnx.LayerNorm(config.n_embd, epsilon=1e-5, ctx=ctx)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, ctx=ctx)
 
     def __call__(self, x: jax.Array, *, ctx: nnx.Context) -> jax.Array:
         x = x + self.attn(self.ln_1(x), ctx=ctx)
@@ -99,6 +100,8 @@ class Block(nnx.Module):
 
 
 class GPT(nnx.Module):
+    h: List[Block] = nnx.node_field()
+
     def __init__(self, config: GPTConfig, *, ctx: nnx.Context):
         assert config.vocab_size is not None
         assert config.block_size is not None
@@ -147,14 +150,7 @@ class GPT(nnx.Module):
 
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-
-        # self.transformer.wpe.weight = nnx.Parameter(self.transformer.wpe.weight[:block_size])
-        def crop_weights(path: Tuple[str, ...], x):
-            if path[-2:] == ("wpe", "embedding"):
-                return x[:block_size]
-            return x
-
-        return freeze(path_aware_map(crop_weights, params))
+        self.wpe.embedding = self.wpe.embedding[:block_size]
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -182,72 +178,55 @@ class GPT(nnx.Module):
 
         # create a from-scratch initialized minGPT model
         config = GPTConfig(block_size=1024, **config_args)
-        model = GPT(config)
-        variables = jax.eval_shape(
-            lambda: model.init(
-                jax.random.PRNGKey(0), jnp.ones((1, 1), dtype=jnp.int32), train=False
-            )
-        )
-        params = variables["params"]
-        flat_params = traverse_util.flatten_dict(params, sep=".")
+        ctx = nnx.Context(jax.random.PRNGKey(0), flags=dict(deterministic=False))
+        model = GPT(config, ctx=ctx)
+        partition, treedef = model.get_ref_partition()
+        flat_params = {".".join(path): x for path, x in partition.items()}
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        def copy_from(flax_name, pt_name, transpose=False, add_head_dim=False):
+        def copy_from(flax_name, pt_name):
             pt_tensor = sd_hf[pt_name]
-            jax_array = flat_params[flax_name]
-            if transpose:
-                pt_tensor = pt_tensor.t()
+            ref = flat_params[flax_name + "__ref"]
             pt_array = pt_tensor.detach().cpu().numpy()
 
-            if add_head_dim:
-                # pt_array = pt_array.reshape(*pt_array.shape[:-1], config.n_head, -1, 3)
-                pass
+            assert pt_array.shape == ref.value.shape
 
-            assert pt_array.shape == jax_array.shape
-
-            flat_params[flax_name] = pt_array
+            ref.value = pt_array
 
         # transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         copy_from("wte.embedding", "transformer.wte.weight")
         copy_from("wpe.embedding", "transformer.wpe.weight")
 
         for i in range(config.n_layer):
-            copy_from(f"h_{i}.ln_1.scale", f"transformer.h.{i}.ln_1.weight")
-            copy_from(f"h_{i}.ln_1.bias", f"transformer.h.{i}.ln_1.bias")
+            copy_from(f"h.{i}.ln_1.scale", f"transformer.h.{i}.ln_1.weight")
+            copy_from(f"h.{i}.ln_1.bias", f"transformer.h.{i}.ln_1.bias")
             copy_from(
-                f"h_{i}.attn.c_attn.kernel",
-                f"transformer.h.{i}.attn.c_attn.weight",
-                add_head_dim=True,
+                f"h.{i}.attn.c_attn.kernel", f"transformer.h.{i}.attn.c_attn.weight"
             )
+            copy_from(f"h.{i}.attn.c_attn.bias", f"transformer.h.{i}.attn.c_attn.bias")
             copy_from(
-                f"h_{i}.attn.c_attn.bias",
-                f"transformer.h.{i}.attn.c_attn.bias",
-                add_head_dim=True,
+                f"h.{i}.attn.c_proj.kernel", f"transformer.h.{i}.attn.c_proj.weight"
             )
+            copy_from(f"h.{i}.attn.c_proj.bias", f"transformer.h.{i}.attn.c_proj.bias")
+            copy_from(f"h.{i}.ln_2.scale", f"transformer.h.{i}.ln_2.weight")
+            copy_from(f"h.{i}.ln_2.bias", f"transformer.h.{i}.ln_2.bias")
+            copy_from(f"h.{i}.mlp.c_fc.kernel", f"transformer.h.{i}.mlp.c_fc.weight")
+            copy_from(f"h.{i}.mlp.c_fc.bias", f"transformer.h.{i}.mlp.c_fc.bias")
             copy_from(
-                f"h_{i}.attn.c_proj.kernel", f"transformer.h.{i}.attn.c_proj.weight"
+                f"h.{i}.mlp.c_proj.kernel", f"transformer.h.{i}.mlp.c_proj.weight"
             )
-            copy_from(f"h_{i}.attn.c_proj.bias", f"transformer.h.{i}.attn.c_proj.bias")
-            copy_from(f"h_{i}.ln_2.scale", f"transformer.h.{i}.ln_2.weight")
-            copy_from(f"h_{i}.ln_2.bias", f"transformer.h.{i}.ln_2.bias")
-            copy_from(f"h_{i}.mlp.c_fc.kernel", f"transformer.h.{i}.mlp.c_fc.weight")
-            copy_from(f"h_{i}.mlp.c_fc.bias", f"transformer.h.{i}.mlp.c_fc.bias")
-            copy_from(
-                f"h_{i}.mlp.c_proj.kernel", f"transformer.h.{i}.mlp.c_proj.weight"
-            )
-            copy_from(f"h_{i}.mlp.c_proj.bias", f"transformer.h.{i}.mlp.c_proj.bias")
+            copy_from(f"h.{i}.mlp.c_proj.bias", f"transformer.h.{i}.mlp.c_proj.bias")
 
         copy_from("ln_f.scale", "transformer.ln_f.weight")
         copy_from("ln_f.bias", "transformer.ln_f.bias")
 
-        params = freeze(traverse_util.unflatten_dict(flat_params, sep="."))
+        return model
 
-        return model, params
-
-    def configure_optimizers(self, params, weight_decay, learning_rate, betas):
+    @staticmethod
+    def configure_optimizers(params: nnx.Partition, weight_decay, learning_rate, betas):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
         We are separating out all parameters of the model into two buckets: those that will experience
@@ -264,9 +243,9 @@ class GPT(nnx.Module):
             )
 
         def partition_fn(path: Tuple[str, ...], x) -> str:
-            if path[-1] in ("bias", "scale", "embedding"):
+            if path[-1] in ("bias__ref", "scale__ref", "embedding__ref"):
                 return "no_decay"
-            elif path[-1] in ("kernel",):
+            elif path[-1] in ("kernel__ref",):
                 return "decay"
             else:
                 raise ValueError(f"Unrecognized parameter: {path}")
@@ -275,15 +254,15 @@ class GPT(nnx.Module):
             "decay": get_optimizer(weight_decay),
             "no_decay": get_optimizer(0.0),
         }
-        param_partitions = freeze(path_aware_map(partition_fn, params))
+        param_partitions = nnx.Partition(
+            {path: partition_fn(path, x) for path, x in params.items()}
+        )
         tx = optax.multi_transform(partition_optimizers, param_partitions)
 
         return tx
 
     # @torch.no_grad()
-    def generate(
-        self, key, params, input_tokens, max_new_tokens, temperature=1.0, top_k=None
-    ):
+    def generate(self, key, input_tokens, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -303,7 +282,8 @@ class GPT(nnx.Module):
             # if the sequence context is growing too long we must crop it at block_size
             # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self.apply({"params": params}, tokens, train=False)
+            ctx = nnx.Context(flags=dict(deterministic=True))
+            logits, _ = self(tokens, ctx=ctx)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, i - 1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -341,11 +321,10 @@ class GPT(nnx.Module):
         params=None,
         **kwargs,
     ):
+        _params, moduledef = self.partition("params")
         if params is None:
-            variables = self.init(
-                jax.random.PRNGKey(0), jnp.ones((1, 1), dtype=jnp.int32), train=False
-            )
-            params = variables["params"]
+            params = _params
+
         if decay_lr:
             assert (
                 warmup_iters is not None
@@ -367,4 +346,6 @@ class GPT(nnx.Module):
             learning_rate=lr_schedule,
             betas=(beta1, beta2),
         )
-        return train_state.TrainState.create(apply_fn=self.apply, params=params, tx=tx)
+        return train_state.TrainState.create(
+            apply_fn=moduledef.apply, params=params, tx=tx
+        )

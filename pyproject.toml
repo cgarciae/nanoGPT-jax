@@ -10,7 +10,7 @@ python = ">=3.8,<3.11"
 jax = ">=0.4.1"
 jaxlib = ">=0.4.1"
 nnx = { path = "../nnx", develop = true }
-torch = ">=1.13.1"
+torch = "<2.0.0"
 optax = ">=0.1.4"
 tiktoken = ">=0.1.2"
 tqdm = ">=4.64.1"
@@ -19,6 +19,7 @@ wandb = ">=0.13.9"
 tensorflow-cpu = ">=2.11.0"
 orbax = ">=0.1.0"
 transformers = ">=4.26.0"
+flax = "^0.6.10"
 
 
 [tool.poetry.group.dev.dependencies]
