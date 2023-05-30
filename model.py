@@ -100,8 +100,6 @@ class Block(nnx.Module):
 
 
 class GPT(nnx.Module):
-    h: List[Block] = nnx.node_field()
-
     def __init__(self, config: GPTConfig, *, ctx: nnx.Context):
         assert config.vocab_size is not None
         assert config.block_size is not None
@@ -109,7 +107,7 @@ class GPT(nnx.Module):
         self.wte = nnx.Embed(config.vocab_size, config.n_embd, ctx=ctx)
         self.wpe = nnx.Embed(config.block_size, config.n_embd, ctx=ctx)
         self.drop = nnx.Dropout(config.dropout)
-        self.h = [Block(config, ctx=ctx) for _ in range(config.n_layer)]
+        self.h = nnx.Seq([Block(config, ctx=ctx) for _ in range(config.n_layer)])
         self.ln_f = nnx.LayerNorm(config.n_embd, epsilon=1e-5, ctx=ctx)
 
         self.config = config
@@ -180,8 +178,7 @@ class GPT(nnx.Module):
         config = GPTConfig(block_size=1024, **config_args)
         ctx = nnx.Context(jax.random.PRNGKey(0), flags=dict(deterministic=False))
         model = GPT(config, ctx=ctx)
-        partition, treedef = model.get_ref_partition()
-        flat_params = {".".join(path): x for path, x in partition.items()}
+        ref_dict = model.state_dict(".")
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -189,7 +186,7 @@ class GPT(nnx.Module):
 
         def copy_from(flax_name, pt_name):
             pt_tensor = sd_hf[pt_name]
-            ref = flat_params[flax_name + "__ref"]
+            ref = ref_dict[flax_name]
             pt_array = pt_tensor.detach().cpu().numpy()
 
             assert pt_array.shape == ref.value.shape
@@ -243,9 +240,9 @@ class GPT(nnx.Module):
             )
 
         def partition_fn(path: Tuple[str, ...], x) -> str:
-            if path[-1] in ("bias__ref", "scale__ref", "embedding__ref"):
+            if path[-1] in ("bias", "scale", "embedding"):
                 return "no_decay"
-            elif path[-1] in ("kernel__ref",):
+            elif path[-1] in ("kernel",):
                 return "decay"
             else:
                 raise ValueError(f"Unrecognized parameter: {path}")
@@ -255,7 +252,7 @@ class GPT(nnx.Module):
             "no_decay": get_optimizer(0.0),
         }
         param_partitions = nnx.Partition(
-            {path: partition_fn(path, x) for path, x in params.items()}
+            (path, partition_fn(path, x)) for path, x in params.items()
         )
         tx = optax.multi_transform(partition_optimizers, param_partitions)
 
