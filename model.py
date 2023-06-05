@@ -107,7 +107,7 @@ class GPT(nnx.Module):
         self.wte = nnx.Embed(config.vocab_size, config.n_embd, ctx=ctx)
         self.wpe = nnx.Embed(config.block_size, config.n_embd, ctx=ctx)
         self.drop = nnx.Dropout(config.dropout)
-        self.h = nnx.Seq([Block(config, ctx=ctx) for _ in range(config.n_layer)])
+        self.h = nnx.Sequence(Block(config, ctx=ctx) for _ in range(config.n_layer))
         self.ln_f = nnx.LayerNorm(config.n_embd, epsilon=1e-5, ctx=ctx)
 
         self.config = config
@@ -178,7 +178,7 @@ class GPT(nnx.Module):
         config = GPTConfig(block_size=1024, **config_args)
         ctx = nnx.Context(jax.random.PRNGKey(0), flags=dict(deterministic=False))
         model = GPT(config, ctx=ctx)
-        ref_dict = model.state_dict(".")
+        ref_dict = model.mutable_state_dict(".")
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -186,12 +186,12 @@ class GPT(nnx.Module):
 
         def copy_from(flax_name, pt_name):
             pt_tensor = sd_hf[pt_name]
-            ref = ref_dict[flax_name]
+            leaf = ref_dict[flax_name]
             pt_array = pt_tensor.detach().cpu().numpy()
 
-            assert pt_array.shape == ref.value.shape
+            assert pt_array.shape == leaf.value.shape
 
-            ref.value = pt_array
+            leaf.value = pt_array
 
         # transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         copy_from("wte.embedding", "transformer.wte.weight")
@@ -223,7 +223,7 @@ class GPT(nnx.Module):
         return model
 
     @staticmethod
-    def configure_optimizers(params: nnx.Partition, weight_decay, learning_rate, betas):
+    def configure_optimizers(params: nnx.State, weight_decay, learning_rate, betas):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
         We are separating out all parameters of the model into two buckets: those that will experience
@@ -251,7 +251,7 @@ class GPT(nnx.Module):
             "decay": get_optimizer(weight_decay),
             "no_decay": get_optimizer(0.0),
         }
-        param_partitions = nnx.Partition(
+        param_partitions = nnx.State(
             (path, partition_fn(path, x)) for path, x in params.items()
         )
         tx = optax.multi_transform(partition_optimizers, param_partitions)

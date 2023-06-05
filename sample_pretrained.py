@@ -30,7 +30,7 @@ exec(open("configurator.py").read())  # overrides from command line or config fi
 
 # model
 override_args = dict(dropout=0.0)
-model = GPT.from_pretrained(model_type, override_args)
+model = GPT.from_pretrained(model_type, override_args).split()
 
 # load tokenizer
 enc = tiktoken.get_encoding("gpt2")
@@ -43,10 +43,10 @@ x = jnp.array(start_ids, dtype=jnp.int32)[None]
 key = jax.random.PRNGKey(seed)
 
 
-@nnx.jit_filter
+@jax.jit
 @print_compiling
-def _sample(model: GPT, key, tokens) -> jax.Array:
-    return model.generate(
+def _sample(model: nnx.PureModule[GPT], key, tokens) -> jax.Array:
+    return model.merge().generate(
         key,
         tokens,
         max_new_tokens=max_new_tokens,
