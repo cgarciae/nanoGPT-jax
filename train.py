@@ -141,8 +141,7 @@ if init_from == "scratch":
     # init a new model from scratch
     print("Initializing a new model from scratch")
     gptconf = GPTConfig(**model_args)
-    ctx = nnx.Context(jax.random.PRNGKey(0))
-    model = GPT(gptconf, ctx=ctx)
+    model = GPT(gptconf, ctx=nnx.context(0))
     # initialize weights
     state = model.create_state(**config)
     params = state.params
@@ -187,7 +186,7 @@ def forward(state, batch, *, train: bool):
     if train and dropout > 0.0:
         rngs["dropout"] = jax.random.fold_in(jax.random.PRNGKey(0), state.step)
 
-    ctx = nnx.Context(rngs=rngs, flags=dict(deterministic=False))
+    ctx = nnx.context(**rngs, flags=dict(deterministic=False))
     return state.apply_fn([state.params])(inputs, targets=labels, ctx=ctx)[0]
 
 

@@ -30,7 +30,7 @@ exec(open("configurator.py").read())  # overrides from command line or config fi
 
 # model
 override_args = dict(dropout=0.0)
-model = GPT.from_pretrained(model_type, override_args).split()
+model = GPT.from_pretrained(model_type, override_args).partition()
 
 # load tokenizer
 enc = tiktoken.get_encoding("gpt2")

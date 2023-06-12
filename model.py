@@ -176,9 +176,9 @@ class GPT(nnx.Module):
 
         # create a from-scratch initialized minGPT model
         config = GPTConfig(block_size=1024, **config_args)
-        ctx = nnx.Context(jax.random.PRNGKey(0), flags=dict(deterministic=False))
+        ctx = nnx.context(0, flags=dict(deterministic=False))
         model = GPT(config, ctx=ctx)
-        ref_dict = model.mutable_state_dict(".")
+        sd_nnx = model.mutable_state_dict(".")
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -186,12 +186,12 @@ class GPT(nnx.Module):
 
         def copy_from(flax_name, pt_name):
             pt_tensor = sd_hf[pt_name]
-            leaf = ref_dict[flax_name]
-            pt_array = pt_tensor.detach().cpu().numpy()
+            leaf = sd_nnx[flax_name]
+            np_array = pt_tensor.detach().cpu().numpy()
 
-            assert pt_array.shape == leaf.value.shape
+            assert np_array.shape == leaf.value.shape
 
-            leaf.value = pt_array
+            leaf.value = np_array
 
         # transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         copy_from("wte.embedding", "transformer.wte.weight")
@@ -279,7 +279,7 @@ class GPT(nnx.Module):
             # if the sequence context is growing too long we must crop it at block_size
             # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            ctx = nnx.Context(flags=dict(deterministic=True))
+            ctx = nnx.context(flags=dict(deterministic=True))
             logits, _ = self(tokens, ctx=ctx)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, i - 1, :] / temperature
