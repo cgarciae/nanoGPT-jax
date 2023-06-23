@@ -7,7 +7,6 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
-import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -44,7 +43,8 @@ class CausalSelfAttention(nnx.Module):
         self.n_embd = config.n_embd
         self.block_size = config.block_size
 
-    def init_cache(self, batch_size: int):
+    def init_cache(self, batch_size: int, max_size: int):
+        n_features = self.n_embd // self.n_head
         # cache
         self.index = nnx.var(
             "cache",
@@ -54,16 +54,16 @@ class CausalSelfAttention(nnx.Module):
         self.key = nnx.var(
             "cache",
             jnp.zeros(
-                (batch_size, self.n_head, self.block_size, self.n_embd),
-                jnp.bfloat16,
+                (batch_size, self.n_head, max_size, n_features),
+                jnp.float32,
             ),
             # P(sharding.batch, sharding.heads, sharding.depth, None),
         )
         self.value = nnx.var(
             "cache",
             jnp.zeros(
-                (batch_size, self.n_head, self.block_size, self.n_embd),
-                jnp.bfloat16,
+                (batch_size, self.n_head, max_size, n_features),
+                jnp.float32,
             ),
             # P(sharding.batch, sharding.heads, sharding.depth, None),
         )
@@ -75,6 +75,7 @@ class CausalSelfAttention(nnx.Module):
     def __call__(self, x: jax.Array, *, ctx: nnx.Context) -> jax.Array:
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.shape
+        H = self.n_head
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = jnp.split(self.c_attn(x), 3, axis=-1)
@@ -86,21 +87,24 @@ class CausalSelfAttention(nnx.Module):
         v = v.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2)
 
         if ctx.get_flag("inference"):
-            Tk = self.block_size
-            k = self.key = self.key.at[:, :, self.index : self.index + 1].set(k)
-            v = self.value = self.value.at[:, :, self.index : self.index + 1].set(v)
-            mask = (jnp.arange(Tk) <= self.index).reshape((1, 1, 1, Tk))
+            Tk = self.key.shape[2]
+            assert k.shape[2] == 1
+            assert v.shape[2] == 1
+
+            k = self.key = self.key.at[:, :, self.index].set(k[:, :, 0])
+            v = self.value = self.value.at[:, :, self.index].set(v[:, :, 0])
+            mask = jnp.broadcast_to(jnp.arange(Tk) <= self.index, (B, H, 1, Tk))
             self.index += 1
         else:
-            mask = jnp.tri(T).reshape((1, 1, T, T))
+            mask = jnp.broadcast_to(jnp.tri(T), (B, H, T, T))
 
         # causal self-attention; Self-attend:
-        #   (B, nh, Tq, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        #   (B, nh, Tq, hs) x (B, nh, hs, Tk) -> (B, nh, Tq, Tk)
         att = (q @ k.swapaxes(-2, -1)) * (1.0 / jnp.sqrt(k.shape[-1]))
         att = jnp.where(mask == 0, float("-inf"), att)
         att = nnx.softmax(att, axis=-1)
         att = self.attn_dropout(att, ctx=ctx)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = att @ v  # (B, nh, Tq, Tk) x (B, nh, Tk, hs) -> (B, nh, Tq, hs)
         # re-assemble all head outputs side by side
         y = y.swapaxes(1, 2).reshape(B, T, C)
         # output projection
@@ -304,10 +308,24 @@ class GPT(nnx.Module):
         B, T = input_tokens.shape
         padding = jnp.zeros((B, max_new_tokens), dtype=jnp.int32)
         tokens = jnp.concatenate([input_tokens, padding], axis=-1)
-        indexes = jnp.arange(T, T + max_new_tokens)
+        indexes = jnp.arange(1, T + max_new_tokens)
+
+        initial_token = tokens[:, 0]
+        tokens = tokens.swapaxes(0, 1)[1:]
+
+        (params, cache), moduledef = self.partition("params", "cache")
+
+        carry = (cache, initial_token)
+        inputs = (tokens, indexes)
 
         # tokens index -> tokens None
-        def scan_f(tokens, i):
+        def scan_f(
+            carry: Tuple[nnx.State, jax.Array],
+            inputs: Tuple[jax.Array, jax.Array],
+        ):
+            cache, prev_token = carry
+            next_input_token, i = inputs
+            prev_token = prev_token[:, None]
             # l: x y
             # t: a b - -
             # i: 0 1 2 3
@@ -315,10 +333,11 @@ class GPT(nnx.Module):
             # if the sequence context is growing too long we must crop it at block_size
             # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            ctx = nnx.context(flags=dict(deterministic=True))
-            logits, _ = self(tokens, ctx=ctx)
+            ctx = nnx.context(flags=dict(deterministic=True, inference=True))
+            module = moduledef.merge(params, cache)
+            logits, _ = module(prev_token, ctx=ctx)
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, i - 1, :] / temperature
+            logits = logits[:, 0, :] / temperature
             # optionally crop the logits to only the top k options
             # sample from the distribution
             if top_k is not None:
@@ -332,12 +351,20 @@ class GPT(nnx.Module):
             else:
                 next_token = jax.random.categorical(step_key, logits, axis=-1)
                 # logits = jnp.where(logits < v[:, -1:], float('-inf'), logits)
-            # append sampled index to the running sequence and continue
-            tokens = tokens.at[:, i].set(next_token)
 
-            return tokens, None
+            next_token = jnp.where(i < T, next_input_token, next_token)
 
-        tokens, _ = jax.lax.scan(scan_f, tokens, indexes)
+            cache = module.filter("cache")
+            carry = cache, next_token
+
+            return carry, next_token
+
+        (cache, _), tokens = jax.lax.scan(scan_f, carry, inputs)
+
+        tokens = tokens.swapaxes(0, 1)
+        tokens = jnp.concatenate([initial_token[:, None], tokens], axis=-1)
+
+        self.update_state(cache)
 
         return tokens
 
