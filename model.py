@@ -68,6 +68,10 @@ class CausalSelfAttention(nnx.Module):
             # P(sharding.batch, sharding.heads, sharding.depth, None),
         )
 
+    def reset_index(self):
+        assert hasattr(self, "index")
+        self.index = jnp.array(0, dtype=jnp.int32)
+
     def __call__(self, x: jax.Array, *, ctx: nnx.Context) -> jax.Array:
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.shape
