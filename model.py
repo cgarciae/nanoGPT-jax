@@ -42,6 +42,31 @@ class CausalSelfAttention(nnx.Module):
         # causal mask to ensure that attention is only applied to the left in the input sequence
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.block_size = config.block_size
+
+    def init_cache(self, batch_size: int):
+        # cache
+        self.index = nnx.var(
+            "cache",
+            jnp.array(0, dtype=jnp.int32),
+            # P(),
+        )
+        self.key = nnx.var(
+            "cache",
+            jnp.zeros(
+                (batch_size, self.n_head, self.block_size, self.n_embd),
+                jnp.bfloat16,
+            ),
+            # P(sharding.batch, sharding.heads, sharding.depth, None),
+        )
+        self.value = nnx.var(
+            "cache",
+            jnp.zeros(
+                (batch_size, self.n_head, self.block_size, self.n_embd),
+                jnp.bfloat16,
+            ),
+            # P(sharding.batch, sharding.heads, sharding.depth, None),
+        )
 
     def __call__(self, x: jax.Array, *, ctx: nnx.Context) -> jax.Array:
         # batch size, sequence length, embedding dimensionality (n_embd)
@@ -56,10 +81,17 @@ class CausalSelfAttention(nnx.Module):
         # (B, nh, T, hs)
         v = v.reshape(B, T, self.n_head, C // self.n_head).swapaxes(1, 2)
 
-        mask = jnp.tril(jnp.ones((T, T))).reshape((1, 1, T, T))
+        if ctx.get_flag("inference"):
+            Tk = self.block_size
+            k = self.key = self.key.at[:, :, self.index : self.index + 1].set(k)
+            v = self.value = self.value.at[:, :, self.index : self.index + 1].set(v)
+            mask = (jnp.arange(Tk) <= self.index).reshape((1, 1, 1, Tk))
+            self.index += 1
+        else:
+            mask = jnp.tri(T).reshape((1, 1, T, T))
 
         # causal self-attention; Self-attend:
-        #   (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        #   (B, nh, Tq, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.swapaxes(-2, -1)) * (1.0 / jnp.sqrt(k.shape[-1]))
         att = jnp.where(mask == 0, float("-inf"), att)
         att = nnx.softmax(att, axis=-1)
